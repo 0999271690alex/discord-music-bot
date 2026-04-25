@@ -1,0 +1,15 @@
+[Unit]
+Description=Discord Music Bot
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/discord-music-bot
+ExecStart=/opt/discord-music-bot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+Environment=DISCORD_TOKEN=ВАШ_ТОКЕН_ТУТ
+
+[Install]
+WantedBy=multi-user.target
