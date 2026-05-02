@@ -4,6 +4,7 @@ from discord import app_commands
 import yt_dlp
 import asyncio
 import random
+import time
 from collections import deque
 import os
 
@@ -26,20 +27,36 @@ FFMPEG_OPTIONS = {
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+YTDL_FLAT_OPTIONS = {**YTDL_OPTIONS, "extract_flat": "in_playlist"}
+ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTIONS)
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+QUEUE_PAGE_SIZE = 10
+BAR_LENGTH = 18
+
+
+def format_seconds(seconds: int) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def build_progress_bar(elapsed: int, total: int) -> str:
+    ratio = min(elapsed / total, 1.0) if total else 0
+    filled = int(BAR_LENGTH * ratio)
+    bar = "▓" * filled + "░" * (BAR_LENGTH - filled)
+    return f"`{bar}` {format_seconds(elapsed)} / {format_seconds(total)}"
 
 
 class Track:
     def __init__(self, data: dict):
         self.title: str = data.get("title", "Unknown")
         self.url: str = data.get("webpage_url", data.get("url", ""))
-        # for flat playlist entries url is the watch page, not a stream — leave stream_url empty
         self.stream_url: str = data.get("url", "") if "webpage_url" in data else ""
         self.duration: int = data.get("duration", 0)
         self.thumbnail: str = data.get("thumbnail", "")
-        # fallback: build url from id if missing
         if not self.url and data.get("id"):
             self.url = f"https://www.youtube.com/watch?v={data['id']}"
 
@@ -68,9 +85,7 @@ class Track:
     def format_duration(self) -> str:
         if not self.duration:
             return "?"
-        m, s = divmod(int(self.duration), 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        return format_seconds(self.duration)
 
 
 class MusicPlayer:
@@ -80,6 +95,12 @@ class MusicPlayer:
         self.channel: discord.TextChannel | None = None
         self.voice_client: discord.VoiceClient | None = None
         self._next = asyncio.Event()
+        self._started_at: float = 0.0
+
+    def elapsed(self) -> int:
+        if not self._started_at:
+            return 0
+        return int(time.monotonic() - self._started_at)
 
     def add(self, track: Track) -> None:
         self.queue.append(track)
@@ -101,9 +122,10 @@ class MusicPlayer:
             self._next.clear()
             if not self.queue:
                 self.current = None
+                self._started_at = 0.0
                 if idle_since is None:
-                    idle_since = asyncio.get_event_loop().time()
-                elif asyncio.get_event_loop().time() - idle_since >= 300:
+                    idle_since = time.monotonic()
+                elif time.monotonic() - idle_since >= 300:
                     if self.voice_client and self.voice_client.is_connected():
                         if self.channel:
                             await self.channel.send("Черга порожня — відключаюсь.")
@@ -126,10 +148,14 @@ class MusicPlayer:
                     await self.channel.send(f"Помилка завантаження треку: {e}")
                 continue
 
+            self._started_at = time.monotonic()
             self.voice_client.play(source, after=lambda _: self._next.set())
 
             if self.channel:
-                await self.channel.send(embed=build_now_playing(self.current))
+                await self.channel.send(
+                    embed=build_now_playing(self.current, 0),
+                    view=NowPlayingView(),
+                )
 
             await self._next.wait()
 
@@ -148,20 +174,112 @@ def get_player(guild: discord.Guild) -> MusicPlayer:
     return players[gid]
 
 
-def build_now_playing(track: Track) -> discord.Embed:
+def build_now_playing(track: Track, elapsed: int = -1) -> discord.Embed:
     embed = discord.Embed(
         title="Зараз грає",
         description=f"[{track.title}]({track.url})",
         color=0x1DB954,
     )
-    embed.add_field(name="Тривалість", value=track.format_duration())
+    if track.duration and elapsed >= 0:
+        embed.add_field(name="Прогрес", value=build_progress_bar(elapsed, track.duration), inline=False)
+    else:
+        embed.add_field(name="Тривалість", value=track.format_duration(), inline=False)
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     return embed
 
 
-YTDL_FLAT_OPTIONS = {**YTDL_OPTIONS, "extract_flat": "in_playlist"}
-ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTIONS)
+class NowPlayingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(emoji="⏸", style=discord.ButtonStyle.secondary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if not vc:
+            await interaction.response.send_message("Бот не в каналі.", ephemeral=True)
+            return
+        if vc.is_playing():
+            vc.pause()
+            button.emoji = "▶️"
+        elif vc.is_paused():
+            vc.resume()
+            button.emoji = "⏸"
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await interaction.response.send_message("Пропущено!", ephemeral=True)
+        else:
+            await interaction.response.send_message("Нічого не грає.", ephemeral=True)
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = get_player(interaction.guild)
+        if not player.queue:
+            await interaction.response.send_message("Черга порожня.", ephemeral=True)
+            return
+        player.shuffle()
+        await interaction.response.send_message(
+            f"Перемішано {len(player.queue)} треків!", ephemeral=True
+        )
+
+
+class QueueView(discord.ui.View):
+    def __init__(self, player: MusicPlayer, page: int = 0):
+        super().__init__(timeout=120)
+        self.player = player
+        self.page = page
+        self._refresh_buttons()
+
+    def _total_pages(self) -> int:
+        return max(1, (len(self.player.queue) + QUEUE_PAGE_SIZE - 1) // QUEUE_PAGE_SIZE)
+
+    def _refresh_buttons(self) -> None:
+        self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = self.page >= self._total_pages() - 1
+
+    def build_embed(self) -> discord.Embed:
+        items = list(self.player.queue)
+        total_pages = self._total_pages()
+        start = self.page * QUEUE_PAGE_SIZE
+        page_items = items[start:start + QUEUE_PAGE_SIZE]
+        embed = discord.Embed(
+            title=f"Черга — сторінка {self.page + 1}/{total_pages}",
+            color=0x0099FF,
+        )
+        if self.player.current:
+            embed.add_field(
+                name="Зараз грає",
+                value=f"[{self.player.current.title}]({self.player.current.url}) `{self.player.current.format_duration()}`",
+                inline=False,
+            )
+        if page_items:
+            lines = [
+                f"`{start + i + 1}.` [{t.title}]({t.url}) `{t.format_duration()}`"
+                for i, t in enumerate(page_items)
+            ]
+            embed.add_field(
+                name=f"Черга ({len(items)} треків)",
+                value="\n".join(lines),
+                inline=False,
+            )
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self._total_pages() - 1, self.page + 1)
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 async def fetch_tracks(query: str) -> list[Track]:
@@ -258,7 +376,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
 @bot.tree.command(name="skip", description="Пропустити поточний трек")
 async def skip_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
-    if not vc or not vc.is_playing():
+    if not vc or not (vc.is_playing() or vc.is_paused()):
         await interaction.response.send_message("Нічого не грає.")
         return
     vc.stop()
@@ -289,35 +407,11 @@ async def stop_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="queue", description="Показати чергу треків")
 async def queue_cmd(interaction: discord.Interaction):
     player = get_player(interaction.guild)
-
     if not player.current and not player.queue:
         await interaction.response.send_message("Черга порожня.")
         return
-
-    embed = discord.Embed(title="Черга", color=0x0099FF)
-
-    if player.current:
-        embed.add_field(
-            name="Зараз грає",
-            value=f"[{player.current.title}]({player.current.url}) `{player.current.format_duration()}`",
-            inline=False,
-        )
-
-    if player.queue:
-        items = list(player.queue)[:15]
-        lines = [
-            f"`{i + 1}.` [{t.title}]({t.url}) `{t.format_duration()}`"
-            for i, t in enumerate(items)
-        ]
-        if len(player.queue) > 15:
-            lines.append(f"... і ще {len(player.queue) - 15} треків")
-        embed.add_field(
-            name=f"Черга ({len(player.queue)} треків)",
-            value="\n".join(lines),
-            inline=False,
-        )
-
-    await interaction.response.send_message(embed=embed)
+    view = QueueView(player)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
 
 
 @bot.tree.command(name="shuffle", description="Перемішати чергу")
@@ -363,7 +457,10 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     if not player.current:
         await interaction.response.send_message("Нічого не грає.")
         return
-    await interaction.response.send_message(embed=build_now_playing(player.current))
+    await interaction.response.send_message(
+        embed=build_now_playing(player.current, player.elapsed()),
+        view=NowPlayingView(),
+    )
 
 
 @bot.tree.command(name="volume", description="Змінити гучність (0–100)")
