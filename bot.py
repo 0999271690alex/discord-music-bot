@@ -35,9 +35,13 @@ class Track:
     def __init__(self, data: dict):
         self.title: str = data.get("title", "Unknown")
         self.url: str = data.get("webpage_url", data.get("url", ""))
-        self.stream_url: str = data.get("url", "")
+        # for flat playlist entries url is the watch page, not a stream — leave stream_url empty
+        self.stream_url: str = data.get("url", "") if "webpage_url" in data else ""
         self.duration: int = data.get("duration", 0)
         self.thumbnail: str = data.get("thumbnail", "")
+        # fallback: build url from id if missing
+        if not self.url and data.get("id"):
+            self.url = f"https://www.youtube.com/watch?v={data['id']}"
 
     async def resolve_stream_url(self) -> bool:
         if self.stream_url:
@@ -146,11 +150,18 @@ def build_now_playing(track: Track) -> discord.Embed:
     return embed
 
 
+YTDL_FLAT_OPTIONS = {**YTDL_OPTIONS, "extract_flat": "in_playlist"}
+ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTIONS)
+
+
 async def fetch_tracks(query: str) -> list[Track]:
     loop = asyncio.get_event_loop()
 
     def extract():
         if query.startswith("http"):
+            data = ytdl_flat.extract_info(query, download=False)
+            if data and "entries" in data:
+                return data
             return ytdl.extract_info(query, download=False)
         return ytdl.extract_info(f"ytsearch:{query}", download=False)
 
@@ -159,7 +170,10 @@ async def fetch_tracks(query: str) -> list[Track]:
         return []
 
     if "entries" in data:
-        return [Track(e) for e in data["entries"] if e and (e.get("url") or e.get("webpage_url"))]
+        return [
+            Track(e) for e in data["entries"]
+            if e and (e.get("url") or e.get("webpage_url") or e.get("id"))
+        ]
     return [Track(data)] if data.get("url") else []
 
 
