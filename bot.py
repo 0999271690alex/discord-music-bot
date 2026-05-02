@@ -34,10 +34,26 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 class Track:
     def __init__(self, data: dict):
         self.title: str = data.get("title", "Unknown")
-        self.url: str = data.get("webpage_url", "")
+        self.url: str = data.get("webpage_url", data.get("url", ""))
         self.stream_url: str = data.get("url", "")
         self.duration: int = data.get("duration", 0)
         self.thumbnail: str = data.get("thumbnail", "")
+
+    async def resolve_stream_url(self) -> bool:
+        if self.stream_url:
+            return True
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None, lambda: ytdl.extract_info(self.url, download=False)
+        )
+        if not data or not data.get("url"):
+            return False
+        self.stream_url = data["url"]
+        if not self.thumbnail:
+            self.thumbnail = data.get("thumbnail", "")
+        if not self.duration:
+            self.duration = data.get("duration", 0)
+        return True
 
     def create_source(self) -> discord.PCMVolumeTransformer:
         return discord.PCMVolumeTransformer(
@@ -86,6 +102,10 @@ class MusicPlayer:
             self.current = self.queue.popleft()
 
             try:
+                if not await self.current.resolve_stream_url():
+                    if self.channel:
+                        await self.channel.send(f"Не вдалося отримати трек: {self.current.title}")
+                    continue
                 source = self.current.create_source()
             except Exception as e:
                 if self.channel:
@@ -139,7 +159,7 @@ async def fetch_tracks(query: str) -> list[Track]:
         return []
 
     if "entries" in data:
-        return [Track(e) for e in data["entries"] if e and e.get("url")]
+        return [Track(e) for e in data["entries"] if e and (e.get("url") or e.get("webpage_url"))]
     return [Track(data)] if data.get("url") else []
 
 
