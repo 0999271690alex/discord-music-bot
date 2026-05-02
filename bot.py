@@ -91,6 +91,7 @@ class Track:
 class MusicPlayer:
     def __init__(self):
         self.queue: deque[Track] = deque()
+        self.history: deque[Track] = deque(maxlen=20)
         self.current: Track | None = None
         self.channel: discord.TextChannel | None = None
         self.voice_client: discord.VoiceClient | None = None
@@ -115,6 +116,16 @@ class MusicPlayer:
 
     def clear(self) -> None:
         self.queue.clear()
+
+    def go_previous(self) -> bool:
+        if len(self.history) < 2:
+            return False
+        self.history.pop()
+        prev = self.history.pop()
+        if self.current:
+            self.queue.appendleft(self.current)
+        self.queue.appendleft(prev)
+        return True
 
     async def player_loop(self) -> None:
         idle_since: float | None = None
@@ -149,11 +160,12 @@ class MusicPlayer:
                 continue
 
             self._started_at = time.monotonic()
+            self.history.append(self.current)
             self.voice_client.play(source, after=lambda _: self._next.set())
 
             if self.channel:
                 await self.channel.send(
-                    embed=build_now_playing(self.current, 0),
+                    embed=build_now_playing(self.current),
                     view=NowPlayingView(),
                 )
 
@@ -192,6 +204,17 @@ def build_now_playing(track: Track, elapsed: int = -1) -> discord.Embed:
 class NowPlayingView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = get_player(interaction.guild)
+        if not player.go_previous():
+            await interaction.response.send_message("Немає попереднього треку.", ephemeral=True)
+            return
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        await interaction.response.send_message("Повертаємось назад!", ephemeral=True)
 
     @discord.ui.button(emoji="⏸", style=discord.ButtonStyle.secondary)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
