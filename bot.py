@@ -44,10 +44,12 @@ def format_seconds(seconds: int) -> str:
 
 
 def build_progress_bar(elapsed: int, total: int) -> str:
-    ratio = min(elapsed / total, 1.0) if total else 0
-    pos = int(BAR_LENGTH * ratio)
-    bar = "▬" * pos + "🔘" + "▬" * (BAR_LENGTH - pos)
-    return f"{bar}\n`{format_seconds(elapsed)} / {format_seconds(total)}`"
+    if total:
+        ratio = min(elapsed / total, 1.0)
+        pos = int(BAR_LENGTH * ratio)
+        bar = "▬" * pos + "🔘" + "▬" * (BAR_LENGTH - pos)
+        return f"{bar}\n`{format_seconds(elapsed)} / {format_seconds(total)}`"
+    return f"`{format_seconds(elapsed)}`"
 
 
 class Track:
@@ -97,11 +99,25 @@ class MusicPlayer:
         self.voice_client: discord.VoiceClient | None = None
         self._next = asyncio.Event()
         self._started_at: float = 0.0
+        self._paused_at: float = 0.0
+        self._pause_total: float = 0.0
+        self._progress_task: asyncio.Task | None = None
 
     def elapsed(self) -> int:
         if not self._started_at:
             return 0
-        return int(time.monotonic() - self._started_at)
+        if self._paused_at:
+            return int(self._paused_at - self._started_at - self._pause_total)
+        return int(time.monotonic() - self._started_at - self._pause_total)
+
+    def on_pause(self) -> None:
+        if not self._paused_at:
+            self._paused_at = time.monotonic()
+
+    def on_resume(self) -> None:
+        if self._paused_at:
+            self._pause_total += time.monotonic() - self._paused_at
+            self._paused_at = 0.0
 
     def add(self, track: Track) -> None:
         self.queue.append(track)
@@ -160,16 +176,25 @@ class MusicPlayer:
                 continue
 
             self._started_at = time.monotonic()
+            self._paused_at = 0.0
+            self._pause_total = 0.0
             self.history.append(self.current)
             self.voice_client.play(source, after=lambda _: self._next.set())
 
             if self.channel:
-                await self.channel.send(
-                    embed=build_now_playing(self.current),
+                msg = await self.channel.send(
+                    embed=build_now_playing(self.current, 0),
                     view=NowPlayingView(),
                 )
+                if self._progress_task and not self._progress_task.done():
+                    self._progress_task.cancel()
+                self._progress_task = asyncio.create_task(_progress_updater(msg, self))
 
             await self._next.wait()
+
+            if self._progress_task and not self._progress_task.done():
+                self._progress_task.cancel()
+                self._progress_task = None
 
             if not self.voice_client or not self.voice_client.is_connected():
                 break
@@ -177,6 +202,20 @@ class MusicPlayer:
 
 players: dict[int, MusicPlayer] = {}
 player_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _progress_updater(message: discord.Message, player: MusicPlayer) -> None:
+    while True:
+        await asyncio.sleep(5)
+        if not player.current:
+            break
+        vc = player.voice_client
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            break
+        try:
+            await message.edit(embed=build_now_playing(player.current, player.elapsed()))
+        except (discord.NotFound, discord.HTTPException):
+            break
 
 
 def get_player(guild: discord.Guild) -> MusicPlayer:
@@ -222,11 +261,14 @@ class NowPlayingView(discord.ui.View):
         if not vc:
             await interaction.response.send_message("Бот не в каналі.", ephemeral=True)
             return
+        player = get_player(interaction.guild)
         if vc.is_playing():
             vc.pause()
+            player.on_pause()
             button.emoji = "▶️"
         elif vc.is_paused():
             vc.resume()
+            player.on_resume()
             button.emoji = "⏸"
         await interaction.response.edit_message(view=self)
 
@@ -410,6 +452,11 @@ async def skip_cmd(interaction: discord.Interaction):
 async def stop_cmd(interaction: discord.Interaction):
     gid = interaction.guild_id
     player = get_player(interaction.guild)
+
+    if player._progress_task and not player._progress_task.done():
+        player._progress_task.cancel()
+        player._progress_task = None
+
     player.clear()
     player.current = None
 
@@ -459,6 +506,7 @@ async def pause_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
+        get_player(interaction.guild).on_pause()
         await interaction.response.send_message("Пауза.")
     else:
         await interaction.response.send_message("Нічого не грає.")
@@ -469,6 +517,7 @@ async def resume_cmd(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
+        get_player(interaction.guild).on_resume()
         await interaction.response.send_message("Продовжено.")
     else:
         await interaction.response.send_message("Нічого не на паузі.")
