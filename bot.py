@@ -96,12 +96,22 @@ class MusicPlayer:
         self.queue.clear()
 
     async def player_loop(self) -> None:
+        idle_since: float | None = None
         while True:
             self._next.clear()
             if not self.queue:
                 self.current = None
-                await asyncio.sleep(1)
+                if idle_since is None:
+                    idle_since = asyncio.get_event_loop().time()
+                elif asyncio.get_event_loop().time() - idle_since >= 300:
+                    if self.voice_client and self.voice_client.is_connected():
+                        if self.channel:
+                            await self.channel.send("Черга порожня — відключаюсь.")
+                        await self.voice_client.disconnect()
+                    break
+                await asyncio.sleep(5)
                 continue
+            idle_since = None
 
             self.current = self.queue.popleft()
 
