@@ -45,9 +45,9 @@ def format_seconds(seconds: int) -> str:
 
 def build_progress_bar(elapsed: int, total: int) -> str:
     ratio = min(elapsed / total, 1.0) if total else 0
-    filled = int(BAR_LENGTH * ratio)
-    bar = "▓" * filled + "░" * (BAR_LENGTH - filled)
-    return f"`{bar}` {format_seconds(elapsed)} / {format_seconds(total)}"
+    pos = int(BAR_LENGTH * ratio)
+    bar = "▬" * pos + "🔘" + "▬" * (BAR_LENGTH - pos)
+    return f"{bar}\n`{format_seconds(elapsed)} / {format_seconds(total)}`"
 
 
 class Track:
